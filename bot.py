@@ -22,7 +22,7 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 if not TG_TOKEN or not GROQ_API_KEY:
     raise RuntimeError("Не заданы переменные TG_TOKEN и/или GROQ_API_KEY в Amvera!")
 
-MAIN_MODEL = "openai/gpt-oss-120b"
+MAIN_MODEL = "llama-3.1-8b-instant"
 FACTS_MODEL = "llama-3.1-8b-instant"
 
 bot = telebot.TeleBot(TG_TOKEN)
