@@ -22,7 +22,7 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 if not TG_TOKEN or not GROQ_API_KEY:
     raise RuntimeError("Не заданы переменные TG_TOKEN и/или GROQ_API_KEY в Amvera!")
 
-MAIN_MODEL = "llama-3.1-8b-instant"
+MAIN_MODEL = "llama-3.1-8b-instant"  # Временно переключаемся на рабочую модель
 FACTS_MODEL = "llama-3.1-8b-instant"
 
 bot = telebot.TeleBot(TG_TOKEN)
@@ -37,45 +37,29 @@ def health():
 
 def run_server():
     port = int(os.getenv('PORT', 8080))
-    logger.info(f"Запускаю HTTP-сервер на порту {port}...")
     serve(flask_app, host='0.0.0.0', port=port)
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# --- БАЗА ДАННЫХ (С АВТОМИГРАЦИЕЙ) ---
+# --- БАЗА ДАННЫХ ---
 try:
     os.makedirs('/data', exist_ok=True)
     DB_NAME = '/data/bot_data.db'
+    with open('/data/.wtest', 'w') as f:
+        f.write('ok')
 except Exception:
     DB_NAME = 'bot_data.db'
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        # Создаем таблицу со всеми колонками, если ее нет
         cursor.execute('''CREATE TABLE IF NOT EXISTS users
-                          (user_id INTEGER PRIMARY KEY, 
-                           gender TEXT DEFAULT 'unknown', 
-                           mood INTEGER DEFAULT 5,
-                           last_seen REAL DEFAULT 0, 
-                           facts TEXT DEFAULT '', 
-                           history TEXT DEFAULT '[]')''')
-        
-        # Проверяем, какие колонки уже есть, и добавляем недостающие
-        cursor.execute("PRAGMA table_info(users)")
-        columns = [col[1] for col in cursor.fetchall()]
-        
-        if 'gender' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN gender TEXT DEFAULT 'unknown'")
-        if 'mood' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN mood INTEGER DEFAULT 5")
-        if 'last_seen' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN last_seen REAL DEFAULT 0")
-        if 'facts' not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN facts TEXT DEFAULT ''")
-        if 'history' not in columns:
+                          (user_id INTEGER PRIMARY KEY, gender TEXT, mood INTEGER DEFAULT 5,
+                           last_seen REAL, facts TEXT DEFAULT '', history TEXT DEFAULT '[]')''')
+        try:
             cursor.execute("ALTER TABLE users ADD COLUMN history TEXT DEFAULT '[]'")
-            
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 init_db()
@@ -98,7 +82,7 @@ def save_user(user_id, gender, mood, last_seen, facts, history_json):
                        (user_id, gender, mood, last_seen, facts, history_json))
         conn.commit()
 
-# --- АНАЛИЗАТОР СООБЩЕНИЙ ---
+# --- АНАЛИЗАТОР ---
 def detect_gender(text, current_gender):
     if current_gender != "unknown":
         return current_gender
@@ -112,7 +96,7 @@ def detect_gender(text, current_gender):
 def extract_facts(user_text, current_facts):
     if len(user_text.split()) < 3 or any(w in user_text.lower() for w in ['лох', 'чмо', 'нахуй', 'еблан', 'привет', 'как дела']):
         return current_facts
-    prompt = f"Извлеки из текста один короткий факт о пользователе (имя, город, работа, увлечение, странность). Если факта нет, напиши строго НЕТ. Текст: '{user_text}'"
+    prompt = f"Извлеки из текста один короткий факт о пользователе. Если факта нет, напиши строго НЕТ. Текст: '{user_text}'"
     try:
         completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
@@ -125,7 +109,7 @@ def extract_facts(user_text, current_facts):
             if fact.lower() not in current_facts.lower():
                 return f"{current_facts} | {fact}" if current_facts else fact
     except Exception as e:
-        logger.error(f"Fact extraction error: {e}")
+        logger.error(f"Fact extraction error: {type(e).__name__} - {str(e)}")
     return current_facts
 
 # --- СИСТЕМНЫЙ ПРОМПТ ---
@@ -162,6 +146,7 @@ def build_system_prompt(gender, mood, facts):
         gender_desc = "ПОКА НЕИЗВЕСТНО"
         grammar = "Пол пока неизвестен, не используй половые окончания."
         nicknames = "Обращайся на «ты», нейтрально: чел, солнце, дуралей."
+    
     return SYSTEM_PROMPT_TEMPLATE.format(
         USER_GENDER_DESC=gender_desc,
         GRAMMAR_RULE=grammar,
@@ -208,6 +193,25 @@ def web_app_data_handler(message):
 def handle_text(message):
     handle_ai_response(message.chat.id, message.text)
 
+def call_groq_with_retry(messages, max_retries=3):
+    """Пытается вызвать Groq с повторными попытками"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Groq attempt {attempt + 1}/{max_retries}")
+            response = client.chat.completions.create(
+                messages=messages,
+                model=MAIN_MODEL,
+                max_tokens=150,
+                temperature=0.8
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Groq attempt {attempt + 1} failed: {type(e).__name__} - {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Экспоненциальная задержка
+            else:
+                raise
+
 def handle_ai_response(chat_id, user_text):
     gender, current_mood, last_seen, facts, history_json = get_user(chat_id)
     current_time = time.time()
@@ -246,13 +250,7 @@ def handle_ai_response(chat_id, user_text):
 
     try:
         bot.send_chat_action(chat_id, 'typing')
-        chat_completion = client.chat.completions.create(
-            messages=history,
-            model=MAIN_MODEL,
-            max_tokens=150,
-            temperature=0.8
-        )
-        response = chat_completion.choices[0].message.content.strip()
+        response = call_groq_with_retry(history)
         response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
 
         if not response:
@@ -269,13 +267,11 @@ def handle_ai_response(chat_id, user_text):
 
         history.append({"role": "assistant", "content": response})
         save_user(chat_id, gender, current_mood, current_time, facts, json.dumps(history, ensure_ascii=False))
-        
         bot.send_message(chat_id, response, reply_markup=markup)
         
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Final error: {type(e).__name__} - {str(e)}")
         bot.send_message(chat_id, "Бля, у меня мозги кипят. Напиши через минуту.")
 
-if __name__ == '__main__':
-    logger.info("✅ Бот запускается и начинает слушать Telegram...")
-    bot.infinity_polling()
+print("✅ Bot is up and running!")
+bot.polling(none_stop=True)
