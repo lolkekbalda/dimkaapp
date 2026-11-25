@@ -8,9 +8,6 @@ import os
 import re
 import logging
 import json
-import threading
-from flask import Flask
-from waitress import serve
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,41 +17,25 @@ TG_TOKEN = os.getenv('TG_TOKEN')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 if not TG_TOKEN or not GROQ_API_KEY:
-    raise RuntimeError("Не заданы переменные TG_TOKEN и/или GROQ_API_KEY в Amvera!")
+    raise RuntimeError("Не заданы переменные TG_TOKEN и/или GROQ_API_KEY!")
 
-MAIN_MODEL = "llama-3.1-8b-instant"  # Временно переключаемся на рабочую модель
+# Модель — попробуй ту, что работала раньше
+MAIN_MODEL = "qwen/qwen3-32b"
 FACTS_MODEL = "llama-3.1-8b-instant"
 
 bot = telebot.TeleBot(TG_TOKEN)
+bot.remove_webhook()
 client = Groq(api_key=GROQ_API_KEY)
 
-# --- HTTP-СЕРВЕР ДЛЯ AMVERA ---
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def health():
-    return 'OK', 200
-
-def run_server():
-    port = int(os.getenv('PORT', 8080))
-    serve(flask_app, host='0.0.0.0', port=port)
-
-threading.Thread(target=run_server, daemon=True).start()
-
 # --- БАЗА ДАННЫХ ---
-try:
-    os.makedirs('/data', exist_ok=True)
-    DB_NAME = '/data/bot_data.db'
-    with open('/data/.wtest', 'w') as f:
-        f.write('ok')
-except Exception:
-    DB_NAME = 'bot_data.db'
+os.makedirs('/data', exist_ok=True)
+DB_NAME = '/data/bot_data.db'
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute('''CREATE TABLE IF NOT EXISTS users
-                          (user_id INTEGER PRIMARY KEY, gender TEXT, mood INTEGER DEFAULT 5,
+                          (user_id INTEGER PRIMARY KEY, gender TEXT, mood INTEGER DEFAULT 5, 
                            last_seen REAL, facts TEXT DEFAULT '', history TEXT DEFAULT '[]')''')
         try:
             cursor.execute("ALTER TABLE users ADD COLUMN history TEXT DEFAULT '[]'")
@@ -76,13 +57,12 @@ def get_user(user_id):
 def save_user(user_id, gender, mood, last_seen, facts, history_json):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("""INSERT OR REPLACE INTO users
-                          (user_id, gender, mood, last_seen, facts, history)
-                          VALUES (?, ?, ?, ?, ?, ?)""",
+        cursor.execute("""INSERT OR REPLACE INTO users 
+                          (user_id, gender, mood, last_seen, facts, history) 
+                          VALUES (?, ?, ?, ?, ?, ?)""", 
                        (user_id, gender, mood, last_seen, facts, history_json))
         conn.commit()
 
-# --- АНАЛИЗАТОР ---
 def detect_gender(text, current_gender):
     if current_gender != "unknown":
         return current_gender
@@ -109,10 +89,9 @@ def extract_facts(user_text, current_facts):
             if fact.lower() not in current_facts.lower():
                 return f"{current_facts} | {fact}" if current_facts else fact
     except Exception as e:
-        logger.error(f"Fact extraction error: {type(e).__name__} - {str(e)}")
+        logger.error(f"Fact extraction error: {e}")
     return current_facts
 
-# --- СИСТЕМНЫЙ ПРОМПТ ---
 SYSTEM_PROMPT_TEMPLATE = """Ты — Дима, токсичный, колкий, язвительный фембой-омежка с острым языком.
 Ты общаешься в Telegram с реальным человеком. Отвечай ЖИВО, КРАТКО (1-3 предложения), как в переписке.
 
@@ -146,7 +125,6 @@ def build_system_prompt(gender, mood, facts):
         gender_desc = "ПОКА НЕИЗВЕСТНО"
         grammar = "Пол пока неизвестен, не используй половые окончания."
         nicknames = "Обращайся на «ты», нейтрально: чел, солнце, дуралей."
-    
     return SYSTEM_PROMPT_TEMPLATE.format(
         USER_GENDER_DESC=gender_desc,
         GRAMMAR_RULE=grammar,
@@ -155,7 +133,6 @@ def build_system_prompt(gender, mood, facts):
         MOOD=mood
     )
 
-# --- ОБРАБОТЧИКИ ---
 @bot.message_handler(commands=['start'])
 def start_message(message):
     chat_id = message.chat.id
@@ -176,41 +153,22 @@ def handle_gift(call):
     except Exception:
         pass
     if gender == "female":
-        bot.send_message(chat_id, "Ой... ладно, подруня, спасибо за подарочек~ Я даже немного покраснел. Прощаю тебя на первый раз.")
+        bot.send_message(chat_id, "Ой... ладно, подруня, спасибо за подарочек~ Я даже немного покраснел.")
     else:
-        bot.send_message(chat_id, "Ой... ну ладно, братан, подгон засчитан~ Я даже подобрел чуток. Живи пока.")
+        bot.send_message(chat_id, "Ой... ну ладно, братан, подгон засчитан~ Я даже подобрел чуток.")
 
 @bot.message_handler(content_types=['web_app_data'])
 def web_app_data_handler(message):
     try:
         data = json.loads(message.web_app_data.data)
         if data.get("action") == "start_search":
-            bot.send_message(message.chat.id, "Дима получил сигнал! Щас найдем тебе кента, блять. 🔥 Ищи уведомление о матче.")
+            bot.send_message(message.chat.id, "Дима получил сигнал! Щас найдем тебе кента. 🔥")
     except Exception as e:
         logger.error(f"Mini App error: {e}")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     handle_ai_response(message.chat.id, message.text)
-
-def call_groq_with_retry(messages, max_retries=3):
-    """Пытается вызвать Groq с повторными попытками"""
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Groq attempt {attempt + 1}/{max_retries}")
-            response = client.chat.completions.create(
-                messages=messages,
-                model=MAIN_MODEL,
-                max_tokens=150,
-                temperature=0.8
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"Groq attempt {attempt + 1} failed: {type(e).__name__} - {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Экспоненциальная задержка
-            else:
-                raise
 
 def handle_ai_response(chat_id, user_text):
     gender, current_mood, last_seen, facts, history_json = get_user(chat_id)
@@ -235,7 +193,7 @@ def handle_ai_response(chat_id, user_text):
 
     try:
         history = json.loads(history_json)
-    except Exception:
+    except:
         history = []
 
     sys_prompt = build_system_prompt(gender, current_mood, facts)
@@ -250,7 +208,13 @@ def handle_ai_response(chat_id, user_text):
 
     try:
         bot.send_chat_action(chat_id, 'typing')
-        response = call_groq_with_retry(history)
+        chat_completion = client.chat.completions.create(
+            messages=history,
+            model=MAIN_MODEL,
+            max_tokens=150,
+            temperature=0.8
+        )
+        response = chat_completion.choices[0].message.content.strip()
         response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
 
         if not response:
@@ -270,8 +234,8 @@ def handle_ai_response(chat_id, user_text):
         bot.send_message(chat_id, response, reply_markup=markup)
         
     except Exception as e:
-        logger.error(f"Final error: {type(e).__name__} - {str(e)}")
+        logger.error(f"Error: {e}")
         bot.send_message(chat_id, "Бля, у меня мозги кипят. Напиши через минуту.")
 
-print("✅ Bot is up and running!")
+print("Bot is up and running!")
 bot.polling(none_stop=True)
