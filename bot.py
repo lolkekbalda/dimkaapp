@@ -17,10 +17,9 @@ TG_TOKEN = os.getenv('TG_TOKEN')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 if not TG_TOKEN or not GROQ_API_KEY:
-    raise RuntimeError("Не заданы переменные TG_TOKEN и/или GROQ_API_KEY!")
+    raise RuntimeError("Не заданы переменные TG_TOKEN и/или GROQ_API_KEY в Amvera!")
 
-# Модель — попробуй ту, что работала раньше
-MAIN_MODEL = "qwen/qwen3-32b"
+MAIN_MODEL = "llama-3.1-8b-instant"
 FACTS_MODEL = "llama-3.1-8b-instant"
 
 bot = telebot.TeleBot(TG_TOKEN)
@@ -63,6 +62,7 @@ def save_user(user_id, gender, mood, last_seen, facts, history_json):
                        (user_id, gender, mood, last_seen, facts, history_json))
         conn.commit()
 
+# --- АНАЛИЗАТОР ---
 def detect_gender(text, current_gender):
     if current_gender != "unknown":
         return current_gender
@@ -92,6 +92,7 @@ def extract_facts(user_text, current_facts):
         logger.error(f"Fact extraction error: {e}")
     return current_facts
 
+# --- ПРОМПТ ---
 SYSTEM_PROMPT_TEMPLATE = """Ты — Дима, токсичный, колкий, язвительный фембой-омежка с острым языком.
 Ты общаешься в Telegram с реальным человеком. Отвечай ЖИВО, КРАТКО (1-3 предложения), как в переписке.
 
@@ -133,6 +134,7 @@ def build_system_prompt(gender, mood, facts):
         MOOD=mood
     )
 
+# --- ОБРАБОТЧИКИ ---
 @bot.message_handler(commands=['start'])
 def start_message(message):
     chat_id = message.chat.id
@@ -215,27 +217,4 @@ def handle_ai_response(chat_id, user_text):
             temperature=0.8
         )
         response = chat_completion.choices[0].message.content.strip()
-        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-
-        if not response:
-            response = "Пошла нахуй, даже говорить с тобой лень." if gender == "female" else "Пошел нахуй, даже говорить лень."
-
-        if random.random() < 0.25 and not response.endswith("?"):
-            if "блять" not in response.lower():
-                response = response.rstrip(".") + ", блять."
-
-        markup = None
-        if current_mood <= 3:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🎁 Задобрить подарком", callback_data="gift"))
-
-        history.append({"role": "assistant", "content": response})
-        save_user(chat_id, gender, current_mood, current_time, facts, json.dumps(history, ensure_ascii=False))
-        bot.send_message(chat_id, response, reply_markup=markup)
-        
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        bot.send_message(chat_id, "Бля, у меня мозги кипят. Напиши через минуту.")
-
-print("Bot is up and running!")
-bot.polling(none_stop=True)
+        response = re.sub(r'
